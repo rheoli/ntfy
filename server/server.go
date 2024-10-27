@@ -49,7 +49,6 @@ type Server struct {
 	smtpSender        mailer
 	topics            map[string]*topic
 	visitors          map[string]*visitor // ip:<ip> or user:<user>
-	firebaseClient    *firebaseClient
 	messages          int64                               // Total number of messages (persisted if messageCache enabled)
 	messagesHistory   []int64                             // Last n values of the messages counter, used to determine rate
 	userManager       *user.Manager                       // Might be nil!
@@ -119,7 +118,7 @@ var (
 
 	//go:embed docs
 	docsStaticFs     embed.FS
-	docsStaticCached = &util.CachingEmbedFS{ModTime: time.Now(), FS: docsStaticFs}
+	ldocsStaticCached = &util.CachingEmbedFS{ModTime: time.Now(), FS: docsStaticFs}
 )
 
 const (
@@ -194,26 +193,11 @@ func New(conf *Config) (*Server, error) {
 			return nil, err
 		}
 	}
-	var firebaseClient *firebaseClient
-	if conf.FirebaseKeyFile != "" {
-		sender, err := newFirebaseSender(conf.FirebaseKeyFile)
-		if err != nil {
-			return nil, err
-		}
-		// This awkward logic is required because Go is weird about nil types and interfaces.
-		// See issue #641, and https://go.dev/play/p/uur1flrv1t3 for an example
-		var auther user.Auther
-		if userManager != nil {
-			auther = userManager
-		}
-		firebaseClient = newFirebaseClient(sender, auther)
-	}
 	s := &Server{
 		config:          conf,
 		messageCache:    messageCache,
 		webPush:         webPush,
 		fileCache:       fileCache,
-		firebaseClient:  firebaseClient,
 		smtpSender:      mailer,
 		topics:          topics,
 		userManager:     userManager,
@@ -334,7 +318,6 @@ func (s *Server) Run() error {
 	go s.runManager()
 	go s.runStatsResetter()
 	go s.runDelayedSender()
-	go s.runFirebaseKeepaliver()
 
 	return <-errChan
 }
@@ -511,8 +494,8 @@ func (s *Server) handleInternal(w http.ResponseWriter, r *http.Request, v *visit
 		return s.handleMetrics(w, r, v)
 	} else if r.Method == http.MethodGet && (staticRegex.MatchString(r.URL.Path) || r.URL.Path == webServiceWorkerPath || r.URL.Path == webRootHTMLPath) {
 		return s.ensureWebEnabled(s.handleStatic)(w, r, v)
-	} else if r.Method == http.MethodGet && docsRegex.MatchString(r.URL.Path) {
-		return s.ensureWebEnabled(s.handleDocs)(w, r, v)
+	//} else if r.Method == http.MethodGet && docsRegex.MatchString(r.URL.Path) {
+	//	return s.ensureWebEnabled(s.handleDocs)(w, r, v)
 	} else if (r.Method == http.MethodGet || r.Method == http.MethodHead) && fileRegex.MatchString(r.URL.Path) && s.config.AttachmentCacheDir != "" {
 		return s.limitRequests(s.handleFile)(w, r, v)
 	} else if r.Method == http.MethodOptions {
@@ -632,10 +615,10 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request, _ *visitor
 }
 
 // handleDocs returns static resources related to the docs
-func (s *Server) handleDocs(w http.ResponseWriter, r *http.Request, _ *visitor) error {
-	util.Gzip(http.FileServer(http.FS(docsStaticCached))).ServeHTTP(w, r)
-	return nil
-}
+//func (s *Server) handleDocs(w http.ResponseWriter, r *http.Request, _ *visitor) error {
+//	util.Gzip(http.FileServer(http.FS(docsStaticCached))).ServeHTTP(w, r)
+//	return nil
+//}
 
 // handleStats returns the publicly available server stats
 func (s *Server) handleStats(w http.ResponseWriter, _ *http.Request, _ *visitor) error {
@@ -804,9 +787,10 @@ func (s *Server) handlePublishInternal(r *http.Request, v *visitor) (*message, e
 		if err := t.Publish(v, m); err != nil {
 			return nil, err
 		}
-		if s.firebaseClient != nil && firebase {
-			go s.sendToFirebase(v, m)
-		}
+		// TODO Push
+		//if s.firebaseClient != nil && firebase {
+		//	go s.sendToFirebase(v, m)
+		//}
 		if s.smtpSender != nil && email != "" {
 			go s.sendEmail(v, m, email)
 		}
@@ -875,20 +859,6 @@ func (s *Server) handlePublishMatrix(w http.ResponseWriter, r *http.Request, v *
 	minc(metricMessagesPublishedSuccess)
 	minc(metricMatrixPublishedSuccess)
 	return writeMatrixSuccess(w)
-}
-
-func (s *Server) sendToFirebase(v *visitor, m *message) {
-	logvm(v, m).Tag(tagFirebase).Debug("Publishing to Firebase")
-	if err := s.firebaseClient.Send(v, m); err != nil {
-		minc(metricFirebasePublishedFailure)
-		if errors.Is(err, errFirebaseTemporarilyBanned) {
-			logvm(v, m).Tag(tagFirebase).Err(err).Debug("Unable to publish to Firebase: %v", err.Error())
-		} else {
-			logvm(v, m).Tag(tagFirebase).Err(err).Warn("Unable to publish to Firebase: %v", err.Error())
-		}
-		return
-	}
-	minc(metricFirebasePublishedSuccess)
 }
 
 func (s *Server) sendEmail(v *visitor, m *message, email string) {
@@ -1720,29 +1690,6 @@ func (s *Server) resetStats() {
 	}
 }
 
-func (s *Server) runFirebaseKeepaliver() {
-	if s.firebaseClient == nil {
-		return
-	}
-	v := newVisitor(s.config, s.messageCache, s.userManager, netip.IPv4Unspecified(), nil) // Background process, not a real visitor, uses IP 0.0.0.0
-	for {
-		select {
-		case <-time.After(s.config.FirebaseKeepaliveInterval):
-			s.sendToFirebase(v, newKeepaliveMessage(firebaseControlTopic))
-		/*
-			FIXME: Disable iOS polling entirely for now due to thundering herd problem (see #677)
-			       To solve this, we'd have to shard the iOS poll topics to spread out the polling evenly.
-			       Given that it's not really necessary to poll, turning it off for now should not have any impact.
-
-			case <-time.After(s.config.FirebasePollInterval):
-				s.sendToFirebase(v, newKeepaliveMessage(firebasePollTopic))
-		*/
-		case <-s.closeChan:
-			return
-		}
-	}
-}
-
 func (s *Server) runDelayedSender() {
 	for {
 		select {
@@ -1791,9 +1738,10 @@ func (s *Server) sendDelayedMessage(v *visitor, m *message) error {
 			}
 		}()
 	}
-	if s.firebaseClient != nil { // Firebase subscribers may not show up in topics map
-		go s.sendToFirebase(v, m)
-	}
+	// TODO
+	//if s.firebaseClient != nil { // Firebase subscribers may not show up in topics map
+	//	go s.sendToFirebase(v, m)
+	//}
 	if s.config.UpstreamBaseURL != "" {
 		go s.forwardPollRequest(v, m)
 	}

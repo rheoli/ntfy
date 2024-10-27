@@ -4,8 +4,8 @@ build/
 .idea/
 .vscode/
 *.swp
-server/docs/
-server/site/
+x-server/docs/
+x-server/site/
 tools/fbsend/fbsend
 playground/
 secrets/
